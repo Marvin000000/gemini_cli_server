@@ -4,48 +4,14 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
 
-const port = Number(process.env.PORT || 8765);
+const port = Number(process.argv[2] || process.env.PORT || 8765);
 
-function which(cmd) {
-  try {
-    const r = spawnSync("which", [cmd], { encoding: "utf8" });
-    return r.status === 0 ? r.stdout.trim() : "";
-  } catch { return ""; }
-}
 
-function findGeminiExecutable() {
-  if (process.env.GEMINI_CLI_PATH && fs.existsSync(process.env.GEMINI_CLI_PATH)) {
-    return process.env.GEMINI_CLI_PATH;
-  }
-
-  const geminiInPath = which("gemini");
-  if (geminiInPath) {
-    return geminiInPath;
-  }
-
-  const commonPaths = [
-    path.join(process.env.HOME || '', '.gemini/bin/gemini'),
-    '/usr/local/bin/gemini',
-  ];
-  for (const tryPath of commonPaths) {
-    if (fs.existsSync(tryPath)) {
-      return tryPath;
-    }
-  }
-
-  console.error("Could not find the gemini executable.");
-  return null;
-}
-
-const geminiPath = findGeminiExecutable();
 
 function runGemini(prompt) {
   return new Promise((resolve, reject) => {
-    if (!geminiPath) {
-      return reject(new Error("Gemini executable not found."));
-    }
     const args = ['--yolo', '--prompt', prompt, '-m', "gemini-2.5-flash"];
-    const p = spawn(geminiPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const p = spawn("gemini", args, { stdio: ["ignore", "pipe", "pipe"] });
     let out = "", err = "";
     p.stdout.on("data", d => (out += d.toString()));
     p.stderr.on("data", d => (err += d.toString()));
@@ -101,13 +67,10 @@ function cleanup() {
   setTimeout(() => process.exit(0), 1500).unref();
 }
 
-if (geminiPath) {
-  server.listen(port, () => {
-    console.log(`Server listening on http://127.0.0.1:${port}/event`);
-  });
-} else {
-  console.error("Could not start server because Gemini executable was not found.");
-}
+server.listen(port, () => {
+  console.log(`Server listening on http://127.0.0.1:${port}/event`);
+  console.log(`Gemini CLI working directory: ${process.cwd()}`);
+});
 
 process.on("SIGINT", cleanup);
 process.on("SIGTERM", cleanup);
