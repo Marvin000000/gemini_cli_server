@@ -9,38 +9,34 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
 )
 
-type GeminiPayload struct {
-	Source  string `json:"source"`
-	Message string `json:"message"`
-}
-
-type GeminiResponse struct {
-	Reply string `json:"reply"`
-}
-
 type CommandConfig struct {
 	Description string `toml:"description"`
 }
 
 type UserState struct {
-	State string
+	State         string
+	LastSessionID string
+	IsProcessing  bool
 }
 
 var (
 	bot          *tgbotapi.BotAPI
-	geminiURL    string
 	geminiAPIKey string
 	targetChatID int64
 	userStates   = make(map[int64]*UserState)
+	statesMu     sync.RWMutex
 	envFilePath  = ".env"
+	chatsDir     = "/home/dev/.gemini/tmp/gemini-cli-server/chats"
 )
 
 const (
@@ -59,16 +55,6 @@ func main() {
 		log.Fatal("TELEGRAM_BOT_TOKEN environment variable is required")
 	}
 
-	geminiURL = os.Getenv("GEMINI_ENDPOINT")
-	if geminiURL == "" {
-		geminiURL = "http://127.0.0.1:8765/event"
-	} else if !strings.HasPrefix(geminiURL, "http://") && !strings.HasPrefix(geminiURL, "https://") {
-		geminiURL = "http://" + geminiURL
-	}
-	if strings.HasPrefix(geminiURL, "https://") {
-		geminiURL = strings.Replace(geminiURL, "https://", "http://", 1)
-	}
-
 	geminiAPIKey = os.Getenv("GEMINI_API_KEY")
 
 	if chatID := os.Getenv("TARGET_CHAT_ID"); chatID != "" {
@@ -84,7 +70,6 @@ func main() {
 	}
 
 	log.Printf("Authorized on account %s", bot.Self.UserName)
-	log.Printf("Gemini endpoint: %s", geminiURL)
 	log.Printf("Target chat ID: %d", targetChatID)
 
 	if geminiAPIKey != "" {
@@ -106,6 +91,8 @@ func main() {
 }
 
 func getUserState(userID int64) *UserState {
+	statesMu.Lock()
+	defer statesMu.Unlock()
 	if state, exists := userStates[userID]; exists {
 		return state
 	}
@@ -142,6 +129,68 @@ func handleMessage(message *tgbotapi.Message) {
 
 	log.Printf("Processing message from %s: %s", message.From.UserName, text)
 
+	// Handle slash commands
+	if strings.HasPrefix(text, "/") {
+		parts := strings.Fields(text)
+		command := parts[0]
+		
+		switch command {
+		case "/pwd":
+			cwd, _ := os.Getwd()
+			bot.Send(tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf("Current directory: %s", cwd)))
+			return
+		case "/ls":
+			files, err := os.ReadDir(".")
+			if err != nil {
+				bot.Send(tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf("Error reading directory: %v", err)))
+				return
+			}
+			var builder strings.Builder
+			builder.WriteString("Contents of current directory:\n")
+			for _, file := range files {
+				if file.IsDir() {
+					builder.WriteString("📁 " + file.Name() + "/\n")
+				} else {
+					builder.WriteString("📄 " + file.Name() + "\n")
+				}
+			}
+			bot.Send(tgbotapi.NewMessage(message.Chat.ID, builder.String()))
+			return
+		case "/cd":
+			if len(parts) < 2 {
+				bot.Send(tgbotapi.NewMessage(message.Chat.ID, "Usage: /cd <path>"))
+				return
+			}
+			path := parts[1]
+			if err := os.Chdir(path); err != nil {
+				bot.Send(tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf("Error changing directory: %v", err)))
+				return
+			}
+			cwd, _ := os.Getwd()
+			bot.Send(tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf("Changed directory to: %s", cwd)))
+			return
+		case "/new":
+			userState.LastSessionID = ""
+			bot.Send(tgbotapi.NewMessage(message.Chat.ID, "✅ Gemini session reset. Next message will start a new session."))
+			return
+		case "/state":
+			status := "Idle"
+			if userState.IsProcessing {
+				status = "Busy (Executing Gemini)"
+			}
+			sessionID := userState.LastSessionID
+			if sessionID == "" {
+				sessionID = "None (New session will be created)"
+			}
+			bot.Send(tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf("Status: %s\nSession ID: %s", status, sessionID)))
+			log.Printf("User %s requested state: Status=%s, SessionID=%s", message.From.UserName, status, sessionID)
+			return
+		}
+	}
+
+	userState.IsProcessing = true
+	defer func() { userState.IsProcessing = false }()
+
 	var prompt string
 	
 		
@@ -155,7 +204,10 @@ func handleMessage(message *tgbotapi.Message) {
 			context, message.From.FirstName, text)
 	
 
-	reply := callGemini(prompt)
+	reply, newSessionID := callGemini(prompt, userState.LastSessionID)
+	if newSessionID != "" {
+		userState.LastSessionID = newSessionID
+	}
 
 	msg := tgbotapi.NewMessage(message.Chat.ID, reply)
 	if message.ReplyToMessage != nil {
@@ -167,46 +219,77 @@ func handleMessage(message *tgbotapi.Message) {
 	}
 }
 
-func callGemini(prompt string) string {
-	payload := GeminiPayload{
-		Source:  "telegram",
-		Message: prompt,
+func callGemini(prompt string, sessionID string) (string, string) {
+	var args []string
+	if sessionID != "" {
+		log.Printf("[Gemini] Running: BUSY, SessionID: %s", sessionID)
+		args = []string{"--yolo", "-r", sessionID, "-p", prompt}
+	} else {
+		log.Printf("[Gemini] Running: BUSY, SessionID: NEW")
+		args = []string{"--yolo", "-p", prompt}
 	}
 
-	jsonData, err := json.Marshal(payload)
+	cmd := exec.Command("gemini", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil && sessionID != "" {
+		log.Printf("[Gemini] Error resuming session %s: %v. Retrying with new session.", sessionID, err)
+		return callGemini(prompt, "")
+	} else if err != nil {
+		log.Printf("[Gemini] Error executing: %v, output: %s", err, string(output))
+		return fmt.Sprintf("❌ Error executing gemini: %v\n\nOutput:\n%s", err, string(output)), ""
+	}
+
+	newSessionID := findLatestSessionID()
+	log.Printf("[Gemini] Running: IDLE, SessionID: %s", newSessionID)
+	reply := string(output)
+	if strings.TrimSpace(reply) == "" {
+		return "No reply received from Gemini.", newSessionID
+	}
+
+	return reply, newSessionID
+}
+
+func findLatestSessionID() string {
+	files, err := os.ReadDir(chatsDir)
 	if err != nil {
-		log.Printf("Error marshaling JSON: %v", err)
-		return "❌ Error processing request"
+		log.Printf("Error reading chats directory: %v", err)
+		return ""
 	}
 
-	client := &http.Client{Timeout: 300 * time.Second}
-	log.Printf("Calling Gemini at URL: %s", geminiURL)
-	resp, err := client.Post(geminiURL, "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		log.Printf("Error calling Gemini: %v", err)
-		return fmt.Sprintf("❌ Error from Gemini server: %v", err)
-	}
-	defer resp.Body.Close()
+	var latestFile os.DirEntry
+	var latestTime time.Time
 
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Gemini returned status %d", resp.StatusCode)
-		return fmt.Sprintf("❌ Gemini server error: %d", resp.StatusCode)
-	}
-
-	var geminiResp GeminiResponse
-	if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
-		log.Printf("Error decoding response: %v", err)
-		return "❌ Error parsing response"
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), ".json") || !strings.HasPrefix(file.Name(), "session-") {
+			continue
+		}
+		info, err := file.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(latestTime) {
+			latestTime = info.ModTime()
+			latestFile = file
+		}
 	}
 
-	if geminiResp.Reply == "" {
-		return "No reply."
+	if latestFile != nil {
+		name := latestFile.Name()
+		name = strings.TrimSuffix(name, ".json")
+		parts := strings.Split(name, "-")
+		if len(parts) > 0 {
+			return parts[len(parts)-1]
+		}
 	}
 
-	return geminiResp.Reply
+	return ""
 }
 
 func handleVoiceMessage(message *tgbotapi.Message) {
+	userState := getUserState(message.From.ID)
+	userState.IsProcessing = true
+	defer func() { userState.IsProcessing = false }()
+
 	// Check if we have an API key
 	if geminiAPIKey == "" {
 		msg := tgbotapi.NewMessage(message.Chat.ID,
@@ -266,7 +349,11 @@ func handleVoiceMessage(message *tgbotapi.Message) {
 	prompt := fmt.Sprintf("%sYou are an assistant in a Telegram chat.\nAnswer this voice message (transcribed):\n\n%s: %s",
 		context, message.From.FirstName, text)
 
-	reply := callGemini(prompt)
+	reply, newSessionID := callGemini(prompt, userState.LastSessionID)
+	if newSessionID != "" {
+		userState.LastSessionID = newSessionID
+	}
+
 	msg := tgbotapi.NewMessage(message.Chat.ID, reply)
 	if message.ReplyToMessage != nil {
 		msg.ReplyToMessageID = message.MessageID
@@ -490,7 +577,7 @@ func transcribeVoice(fileID string) (string, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{Timeout: 10 * time.Hour}
 	apiResp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("API request failed: %w", err)
