@@ -173,7 +173,7 @@ func handleMessage(message *tgbotapi.Message) {
 			userState.LastSessionID = ""
 			bot.Send(tgbotapi.NewMessage(message.Chat.ID, "✅ Gemini session reset. Next message will start a new session."))
 			return
-		case "/state":
+		case "/status", "/state":
 			status := "Idle"
 			if userState.IsProcessing {
 				status = "Busy (Executing Gemini)"
@@ -183,13 +183,29 @@ func handleMessage(message *tgbotapi.Message) {
 				sessionID = "None (New session will be created)"
 			}
 			bot.Send(tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf("Status: %s\nSession ID: %s", status, sessionID)))
-			log.Printf("User %s requested state: Status=%s, SessionID=%s", message.From.UserName, status, sessionID)
+			log.Printf("User %s requested status: Status=%s, SessionID=%s", message.From.UserName, status, sessionID)
 			return
 		}
 	}
 
 	userState.IsProcessing = true
 	defer func() { userState.IsProcessing = false }()
+
+	// Start typing indicator
+	stopTyping := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			bot.Send(tgbotapi.NewChatAction(message.Chat.ID, tgbotapi.ChatTyping))
+			select {
+			case <-ticker.C:
+			case <-stopTyping:
+				return
+			}
+		}
+	}()
+	defer close(stopTyping)
 
 	var prompt string
 	
@@ -322,9 +338,21 @@ func handleVoiceMessage(message *tgbotapi.Message) {
 		return
 	}
 
-	// Send typing indicator
-	typingConfig := tgbotapi.NewChatAction(message.Chat.ID, tgbotapi.ChatTyping)
-	bot.Send(typingConfig)
+	// Start typing indicator
+	stopTyping := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			bot.Send(tgbotapi.NewChatAction(message.Chat.ID, tgbotapi.ChatTyping))
+			select {
+			case <-ticker.C:
+			case <-stopTyping:
+				return
+			}
+		}
+	}()
+	defer close(stopTyping)
 
 	text, err := transcribeVoice(message.Voice.FileID)
 	if err != nil {

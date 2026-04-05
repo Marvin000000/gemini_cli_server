@@ -1,8 +1,6 @@
 # GeminiCLI Telegram Bot
 
-This project provides a Telegram bot integration for the Gemini CLI, enabling powerful AI-driven automation and interactive responses directly within your Telegram chats. The core idea is to bridge the gap between conversational interfaces and robust command-line automation, allowing Gemini to participate in conversations, respond to messages, and automate tasks in a helpful and informative way while allowing you to move away from your machine but still continue with your vibe coding.
-
-This project was inspired by the original Slack bot concept from [John Capobianco](https://github.com/automateyournetwork/GeminiCLI_Slash_Listen).
+This project provides a Telegram bot integration for the Gemini CLI, enabling powerful AI-driven automation and interactive responses directly within your Telegram chats. The core idea is to bridge the gap between conversational interfaces and robust command-line automation, allowing Gemini to participate in conversations, respond to messages, and automate tasks in a helpful and informative way.
 
 ## Installation
 
@@ -18,20 +16,7 @@ git clone https://github.com/bravian1/gemini_cli_server.git
 
 ### Project Setup
 
-After cloning, copy both the `commands` and `scripts` folders into your `.gemini` directory. This ensures the Gemini CLI can access the necessary configurations and scripts for the Telegram bot integration.
-
-## Core Components and Interaction
-
-This integration relies on two main components:
-
-1.  **`listen.js` (Gemini CLI Webhook Listener):** Located in the `scripts/` directory, this Node.js script acts as an HTTP server that listens for incoming messages and events. It serves as the bridge between the Telegram bot and your Gemini CLI. When it receives a message, it processes it and invokes the Gemini CLI with the provided prompt.
-    *   **YOLO Mode:** By default, `listen.js` invokes the Gemini CLI with the `--yolo` flag. This means Gemini will automatically approve and execute actions without requiring explicit confirmation, enabling a more seamless and automated interaction within the Telegram chat.
-
-2.  **`main.go` (Telegram Bot):** Located in the `telegram_bot/` directory, this Go application is your actual Telegram bot. It interacts directly with the Telegram Bot API, receives messages from users, and forwards them to the `listen.js` endpoint for processing by the Gemini CLI. It then sends Gemini's responses back to the Telegram chat.
-
-**Interaction Flow:**
-
-Telegram User Message -> `main.go` (Telegram Bot) -> `listen.js` (Webhook Listener) -> Gemini CLI -> `listen.js` -> `main.go` -> Telegram User Reply
+This project assumes you have the `gemini` CLI installed and available in your PATH.
 
 ## Telegram Bot Setup
 
@@ -39,56 +24,35 @@ To get your Telegram bot up and running:
 
 1.  **Create a bot with [@BotFather](https://t.me/botfather) on Telegram.** Follow the instructions to create a new bot and obtain your unique bot token.
 2.  **Get your bot token.** This token is essential for your `main.go` application to authenticate with the Telegram API.
-3.  **Set up environment variables in `telegram_bot/.env`:**
+3.  **Set up environment variables in `.env`:**
 
     ```bash
     TELEGRAM_BOT_TOKEN=your_bot_token_here
-    GEMINI_ENDPOINT=http://127.0.0.1:8765/event # or your ngrok URL
-    TARGET_CHAT_ID=                            # optional: specific chat ID for restricted access
+    GEMINI_API_KEY=your_gemini_api_key   # Optional: For voice transcription
+    TARGET_CHAT_ID=                      # Optional: Specific chat ID for restricted access
     ```
     *   `TELEGRAM_BOT_TOKEN`: The token you received from BotFather.
-    *   `GEMINI_ENDPOINT`: This should point to the `/event` endpoint of your `listen.js` server.
-        *   If `listen.js` is running locally, the default is `http://127.0.0.1:8765/event`.
-        *   If you need to expose your local `listen.js` server to the internet (e.g., for Telegram webhooks), you'll need a tunneling service like [ngrok](https://ngrok.com/). In this case, `GEMINI_ENDPOINT` would be your ngrok URL (e.g., `https://your-ngrok-subdomain.ngrok-free.app/event`).
-    *   `TARGET_CHAT_ID`: (Optional) If set, the bot will only respond to messages from this specific chat ID. This is useful for restricting bot access to a private group or chat.
+    *   `GEMINI_API_KEY`: (Optional) If you want the bot to handle voice messages, provide your Gemini API key.
+    *   `TARGET_CHAT_ID`: (Optional) If set, the bot will only respond to messages from this specific chat ID.
 
-## Usage: Telegram Bot Commands
+## Usage: Bot Commands
 
-The Telegram bot dynamically registers commands based on `.toml` files found in the `commands/listen` directory. This allows for easy extension and management of available commands.
+The bot handles several built-in slash commands internally without passing them to Gemini:
 
-For example, to add a new command `/listen_mycommand`, you would create a file named `mycommand.toml` in the `commands/listen` directory with a `description` field:
+*   `/pwd` - Displays the current working directory of the bot.
+*   `/cd <path>` - Changes the working directory of the bot.
+*   `/status` - Shows the current status of the bot (Idle/Busy) and the current session ID.
+*   `/new` - Resets the Gemini session, starting a fresh conversation on the next message.
+*   `/ls` - Lists the contents of the current directory.
 
-```toml
-# commands/listen/mycommand.toml
-description = "This is a description for my new command."
-```
-
-Once the `main.go` application is restarted, `/listen_mycommand` will appear in your Telegram bot's command list with the specified description.
-
-Here are the currently available `/listen` commands (defined in `commands/listen/*.toml`):
-
-*   `/listen: start` - Starts the webhook listener on port 8765, enabling the bot to receive messages.
-*   `/listen: status` - Checks the current operational status of the listener.
-*   `/listen: stop` - Halts the running listener.
-*   `/listen: logs` - Displays the logs generated by the listener, useful for debugging and monitoring.
-*   `/listen: health` - Performs a health check on the listener to ensure it's functioning correctly.
-*   `/listen: help` - Provides a summary of available `/listen` commands and their usage.
-*   `/listen: clear` - Clears the accumulated logs of the listener.
-*   `/listen: live` - Starts the listener in live mode, streaming real-time logs directly to your Gemini CLI terminal (local).
+While Gemini is processing a request, the bot will show a "busy" status (typing...) on Telegram.
 
 ### Running the Telegram Bot
 
-To start your Telegram bot, navigate to the `telegram_bot` directory and run the `main.go` application:
+To start your Telegram bot, run the `main.go` application from the root directory:
 
 ```bash
-cd telegram_bot
 go run main.go
-```
-
-## Testing your listener externally
-If you NGROK out your local 8765 port, you can test your listener by sending a message to the NGROK URL with the following command:
-```bash
-curl -X POST https://your-ngrok.ngrok-free.app/event -H "Content-Type: application/json" -d '{"source":"test","message":"This is a test message from cURL to Gemini CLI. If you are really Gemini CLI please respond with a message that, yes, you are really Gemini CLI and a pleasant haiku for the tester."}'
 ```
 
 ## MCP Integration
