@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -27,6 +28,13 @@ type UserState struct {
 	State         string
 	LastSessionID string
 	IsProcessing  bool
+}
+
+type GeminiStreamChunk struct {
+	Type    string `json:"type"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
+	Delta   bool   `json:"delta"`
 }
 
 var (
@@ -98,6 +106,66 @@ func getUserState(userID int64) *UserState {
 	}
 	userStates[userID] = &UserState{}
 	return userStates[userID]
+}
+
+func processAndSendGeminiResponse(message *tgbotapi.Message, prompt string, userState *UserState) {
+	var msgID int
+	var lastUpdate time.Time
+	var fullText strings.Builder
+	var mu sync.Mutex
+
+	onUpdate := func(delta string) {
+		mu.Lock()
+		defer mu.Unlock()
+		fullText.WriteString(delta)
+
+		// Throttling: Update at most once per second to avoid Telegram rate limits
+		if time.Since(lastUpdate) < 1*time.Second && msgID != 0 {
+			return
+		}
+
+		content := fullText.String()
+		if strings.TrimSpace(content) == "" {
+			return
+		}
+
+		if msgID == 0 {
+			msg := tgbotapi.NewMessage(message.Chat.ID, content)
+			if message.ReplyToMessage != nil {
+				msg.ReplyToMessageID = message.MessageID
+			}
+			sent, err := bot.Send(msg)
+			if err == nil {
+				msgID = sent.MessageID
+				lastUpdate = time.Now()
+			}
+		} else {
+			edit := tgbotapi.NewEditMessageText(message.Chat.ID, msgID, content)
+			_, err := bot.Send(edit)
+			if err == nil {
+				lastUpdate = time.Now()
+			}
+		}
+	}
+
+	reply, newSessionID := callGemini(prompt, userState.LastSessionID, onUpdate)
+	if newSessionID != "" {
+		userState.LastSessionID = newSessionID
+	}
+
+	// Final update to ensure the message is complete and accurate
+	mu.Lock()
+	defer mu.Unlock()
+	if msgID == 0 {
+		msg := tgbotapi.NewMessage(message.Chat.ID, reply)
+		if message.ReplyToMessage != nil {
+			msg.ReplyToMessageID = message.MessageID
+		}
+		bot.Send(msg)
+	} else if fullText.String() != reply {
+		edit := tgbotapi.NewEditMessageText(message.Chat.ID, msgID, reply)
+		bot.Send(edit)
+	}
 }
 
 func handleMessage(message *tgbotapi.Message) {
@@ -220,44 +288,76 @@ func handleMessage(message *tgbotapi.Message) {
 			context, message.From.FirstName, text)
 	
 
-	reply, newSessionID := callGemini(prompt, userState.LastSessionID)
-	if newSessionID != "" {
-		userState.LastSessionID = newSessionID
-	}
-
-	msg := tgbotapi.NewMessage(message.Chat.ID, reply)
-	if message.ReplyToMessage != nil {
-		msg.ReplyToMessageID = message.MessageID
-	}
-
-	if _, err := bot.Send(msg); err != nil {
-		log.Printf("Error sending message: %v", err)
-	}
+	processAndSendGeminiResponse(message, prompt, userState)
 }
 
-func callGemini(prompt string, sessionID string) (string, string) {
+func callGemini(prompt string, sessionID string, onUpdate func(string)) (string, string) {
 	var args []string
 	if sessionID != "" {
 		log.Printf("[Gemini] Running: BUSY, SessionID: %s", sessionID)
-		args = []string{"--yolo", "-r", sessionID, "-p", prompt}
+		args = []string{"--yolo", "-r", sessionID, "-p", prompt, "-o", "stream-json"}
 	} else {
 		log.Printf("[Gemini] Running: BUSY, SessionID: NEW")
-		args = []string{"--yolo", "-p", prompt}
+		args = []string{"--yolo", "-p", prompt, "-o", "stream-json"}
 	}
 
 	cmd := exec.Command("gemini", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil && sessionID != "" {
-		log.Printf("[Gemini] Error resuming session %s: %v. Retrying with new session.", sessionID, err)
-		return callGemini(prompt, "")
-	} else if err != nil {
-		log.Printf("[Gemini] Error executing: %v, output: %s", err, string(output))
-		return fmt.Sprintf("❌ Error executing gemini: %v\n\nOutput:\n%s", err, string(output)), ""
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Sprintf("❌ Error creating stdout pipe: %v", err), ""
+	}
+
+	// Capture stderr for better error reporting
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Sprintf("❌ Error starting gemini: %v", err), ""
+	}
+
+	var fullContent strings.Builder
+	var fullOutput strings.Builder
+
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		line := scanner.Text()
+		fullOutput.WriteString(line + "\n")
+
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+
+		var chunk GeminiStreamChunk
+		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
+			continue
+		}
+
+		if chunk.Type == "message" && chunk.Role == "assistant" && chunk.Content != "" {
+			fullContent.WriteString(chunk.Content)
+			if onUpdate != nil {
+				onUpdate(chunk.Content)
+			}
+		}
+	}
+
+	waitErr := cmd.Wait()
+	if waitErr != nil {
+		// If session resume fails, retry once with new session
+		// Checking stderr and fullOutput for "not found" or similar session errors
+		errMsg := stderr.String() + fullOutput.String()
+		if sessionID != "" && (strings.Contains(errMsg, "not found") || strings.Contains(errMsg, "failed to resume")) {
+			log.Printf("[Gemini] Error resuming session %s. Retrying with new session.", sessionID)
+			return callGemini(prompt, "", onUpdate)
+		}
+
+		log.Printf("[Gemini] Error executing: %v, stderr: %s", waitErr, stderr.String())
+		return fmt.Sprintf("❌ Error executing gemini: %v\n\nStderr:\n%s\n\nOutput:\n%s",
+			waitErr, stderr.String(), fullOutput.String()), ""
 	}
 
 	newSessionID := findLatestSessionID()
 	log.Printf("[Gemini] Running: IDLE, SessionID: %s", newSessionID)
-	reply := string(output)
+	reply := fullContent.String()
 	if strings.TrimSpace(reply) == "" {
 		return "No reply received from Gemini.", newSessionID
 	}
@@ -377,16 +477,7 @@ func handleVoiceMessage(message *tgbotapi.Message) {
 	prompt := fmt.Sprintf("%sYou are an assistant in a Telegram chat.\nAnswer this voice message (transcribed):\n\n%s: %s",
 		context, message.From.FirstName, text)
 
-	reply, newSessionID := callGemini(prompt, userState.LastSessionID)
-	if newSessionID != "" {
-		userState.LastSessionID = newSessionID
-	}
-
-	msg := tgbotapi.NewMessage(message.Chat.ID, reply)
-	if message.ReplyToMessage != nil {
-		msg.ReplyToMessageID = message.MessageID
-	}
-	bot.Send(msg)
+	processAndSendGeminiResponse(message, prompt, userState)
 }
 
 func handleAPIKeyInput(message *tgbotapi.Message) {
